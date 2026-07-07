@@ -39,6 +39,7 @@
     become: true
     vars:
       ansible_async_dir: "{{ ansible_async_dir_root }}"
+    when: scheduler == 'slurm'
     block:
     - name: Set variables for CHS setup
       ansible.builtin.set_fact:
@@ -58,6 +59,7 @@
         state: directory
         suffix: chs_clone
       register: chs_temp_dir
+      delegate_to: localhost
 
     - name: Clone CHS repository
       ansible.builtin.git:
@@ -67,6 +69,7 @@
         accept_hostkey: true
       async: 120
       poll: 10
+      delegate_to: localhost
 
     - name: Install CHS into venv
       ansible.builtin.pip:
@@ -75,12 +78,14 @@
       async: 300
       poll: 10
       become: true
+      when: scheduler == 'slurm'
       vars:
         ansible_async_dir: "{{ ansible_async_dir_root }}"
 
-  - name: Perform CHS Operations
+  - name: Perform CHS Operations (Slurm)
     environment:
       PATH: "{{ chs_venv_path }}/bin:{{ lookup('env', 'PATH') }}"
+    when: scheduler == 'slurm'
     block:
     - name: Configure bucket for CHS
       ansible.builtin.shell: |
@@ -95,7 +100,7 @@
         set -e -u
         chs run --suite {{ item }}
       loop: "{{ chs_suites | default(['standard']) }}"
-      register: chs_runs
+      register: chs_runs_slurm
       async: 3000
       poll: 10
       changed_when: false
@@ -103,7 +108,92 @@
     - name: CHS run output
       ansible.builtin.debug:
         msg: "{{ item.stdout }}"
-      loop: "{{ chs_runs.results }}"
+      loop: "{{ chs_runs_slurm.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+  - name: Perform CHS Operations (GKE)
+    delegate_to: localhost
+    when: scheduler == 'gke'
+    block:
+    - name: "Run CHS suites via run_chs_gke.sh"
+      args:
+        chdir: "{{ chs_temp_dir.path }}"
+      ansible.builtin.shell: |
+        set -e -u -o pipefail
+        
+        # Override the suite in values.yaml
+        sed -i 's/suite: .*/suite: {{ item }}/' helm/values.yaml
+        
+        # Configure gcloud defaults just in case
+        gcloud config set project {{ project | default(custom_vars.project) }}
+        gcloud config set compute/region {{ region }}
+        gcloud config set container/cluster {{ deployment_name }}
+        
+        echo "Running run_chs_gke.sh for suite {{ item }}..."
+        # Create inputs file to avoid YAML indentation issues with heredocs
+        cat << 'EOF_INPUTS' > inputs.txt
+        {{ project | default(custom_vars.project) }}
+        {{ deployment_name }}
+        {{ region }}
+        
+        chs-results
+        EOF_INPUTS
+        
+        # Clean up any leading whitespace caused by YAML indentation
+        sed -i 's/^[[:space:]]*//' inputs.txt
+        
+        # Remove the TODO block that attempts cross-project IAM binding which the CI runner lacks permissions for
+        sed -i '/TODO:.*to remove from here/,/TODO:.*to remove until here/d' ./bin/run_chs_gke.sh
+        
+        # The test runner lacks helm. Download it locally and add it to PATH.
+        if ! command -v helm &> /dev/null; then
+          echo "Helm not found, downloading..."
+          curl -fsSL https://get.helm.sh/helm-v3.14.2-linux-amd64.tar.gz | tar -xz
+          export PATH="$PWD/linux-amd64:$PATH"
+        fi
+        
+        cat inputs.txt | ./bin/run_chs_gke.sh chs-test-{{ item }}
+        
+        # Wait for the orchestrator job to be created
+        echo "Waiting for CHS Orchestrator Job to be created..."
+        
+        # Poll for up to 60 seconds for the job to appear
+        for i in {1..30}; do
+          JOB_NAME=$(kubectl get jobs -n chs-system -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null | grep '^chs-orchestrator' || true)
+          if [[ -n "$JOB_NAME" ]]; then
+            break
+          fi
+          sleep 2
+        done
+        
+        if [[ -z "$JOB_NAME" ]]; then
+          echo "Error: CHS Orchestrator Job not found!"
+          exit 1
+        fi
+        
+        echo "Found Job: $JOB_NAME. Waiting for it to finish..."
+        kubectl wait --for=condition=complete --timeout=30m job/$JOB_NAME -n chs-system || {
+          echo "Job timed out or failed!"
+          kubectl logs job/$JOB_NAME -n chs-system
+          exit 1
+        }
+        
+        echo "Job completed successfully. Logs:"
+        kubectl logs job/$JOB_NAME -n chs-system
+        
+        # Clean up so the next suite can run
+        printf "\n" | ./bin/delete_chs_gke.sh
+      loop: "{{ chs_suites | default(['standard']) }}"
+      register: chs_runs_gke
+      async: 3600
+      poll: 10
+      changed_when: false
+
+    - name: CHS run output
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ chs_runs_gke.results }}"
       loop_control:
         label: "{{ item.item }}"
 
